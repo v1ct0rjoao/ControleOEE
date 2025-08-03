@@ -68,7 +68,7 @@ with st.sidebar:
         st.divider()
         st.subheader("Opções Avançadas")
         
-        # --- CORREÇÃO: valor padrão alterado para False ---
+      
         aplicar_min_dias_up = st.checkbox(
             "Aplicar regra de mínimo de dias 'UP'?", value=False,
             help="Se desmarcado, todos os circuitos com alguma atividade serão considerados."

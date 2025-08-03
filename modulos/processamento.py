@@ -1,7 +1,7 @@
 import pandas as pd
 import re
 import os
-import math 
+import math
 from datetime import datetime, timedelta
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side, NamedStyle
@@ -93,72 +93,124 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     fim_do_ultimo_dia = fim_mes.replace(hour=23, minute=59, second=59)
 
     df_atividades['datastop'] = df_atividades['datastop'].fillna(fim_do_ultimo_dia)
+    df_atividades.dropna(subset=['datastart'], inplace=True)
 
     dias_do_mes_range = pd.date_range(start=inicio_mes, end=fim_mes, freq='D')
     
-    if df_atividades.empty: return None
-        
-    todos_os_circuitos = sorted(df_atividades['circuito'].unique(), key=lambda x: int(re.search(r'\d+', x).group()))
-    dados_calendario = []
-    for circuito in todos_os_circuitos:
-        for dia in dias_do_mes_range:
-            status = 'PP' if dia.weekday() >= 5 else 'SD'
-            dados_calendario.append({'Circuito': circuito, 'Data': dia, 'Status': status})
-
-    if not dados_calendario: return None
-        
-    calendario_df = pd.DataFrame(dados_calendario).set_index(['Circuito', 'Data'])
-
+    todos_circuitos_no_arquivo = set(df_atividades['circuito'].unique())
+    
     circuitos_up_force = regras_de_force.get('circuitos_up', [])
-    tipo_up_force = regras_de_force.get('tipo_up')
     circuitos_pq_force = regras_de_force.get('circuitos_pq', [])
     circuitos_vazio_force = regras_de_force.get('circuitos_vazio', [])
-    todos_circuitos_forcados = set(circuitos_up_force + circuitos_pq_force + circuitos_vazio_force)
+    
+    circuitos_para_processar = (
+        todos_circuitos_no_arquivo.union(set(circuitos_up_force))
+        .union(set(circuitos_pq_force))
+    ).difference(set(circuitos_vazio_force))
+    
+    # --- NOVO: Função de ordenação customizada ---
+    def custom_sort_key(index):
+        # Atribui -1 para 'iDevice' para que ele seja sempre o primeiro.
+        # Para os outros, extrai o número para ordenação numérica.
+        # fillna(9999) trata outros casos não numéricos, colocando-os no final.
+        numeric_parts = index.str.extract(r'(\d+)').iloc[:, 0].fillna('9999').astype(int)
+        numeric_parts[index == 'iDevice'] = -1 
+        return numeric_parts
+    
+    # Remove 'iDevice' da lista de processamento normal se ele estiver lá por acaso
+    circuitos_para_processar.discard('iDevice')
+    
+    circuitos_para_processar = sorted(list(circuitos_para_processar), key=lambda x: int(re.search(r'\d+', x).group()))
 
-    for circuito in circuitos_vazio_force:
-        if circuito in calendario_df.index.get_level_values('Circuito'):
-            calendario_df.loc[circuito, 'Status'] = ''
+    # --- NOVO: Geração dos dados para o circuito especial 'iDevice' ---
+    idevice_data = {}
+    for dia in dias_do_mes_range:
+        # dia.weekday() -> Segunda-feira=0, ..., Sábado=5, Domingo=6
+        status = 'UP' if dia.weekday() < 5 else 'PP'
+        idevice_data[dia.day] = status
+    idevice_series = pd.Series(idevice_data, name='iDevice')
+    
+    # Se não houver outros circuitos para processar, cria um DataFrame vazio para começar
+    if not circuitos_para_processar:
+        calendario_df = pd.DataFrame()
+    else:
+        dados_calendario = []
+        for circuito in circuitos_para_processar:
+            for dia in dias_do_mes_range:
+                status = 'PP' if dia.weekday() >= 5 else 'SD'
+                dados_calendario.append({'Circuito': circuito, 'Data': dia, 'Status': status})
 
-    for circuito in circuitos_pq_force:
-        if circuito in calendario_df.index.get_level_values('Circuito'):
-            calendario_df.loc[circuito, 'Status'] = 'PQ'
+        calendario_df = pd.DataFrame(dados_calendario).set_index(['Circuito', 'Data'])
+    
+    if not calendario_df.empty:
+        df_periodo = df_atividades[df_atividades['circuito'].isin(circuitos_para_processar)].copy()
+    
+        for _, atividade in df_periodo.iterrows():
+            start_day = max(atividade['datastart'].normalize(), pd.Timestamp(inicio_mes))
+            end_day = min(atividade['datastop'].normalize(), pd.Timestamp(fim_mes))
             
-    for circuito in circuitos_up_force:
-        if circuito in calendario_df.index.get_level_values('Circuito'):
-            if tipo_up_force == "Forçar 100% UP":
-                calendario_df.loc[circuito, 'Status'] = 'UP'
-            elif tipo_up_force == "Forçar Semana Padrão (Seg-Sex UP)":
-                for dia in dias_do_mes_range:
-                    if (circuito, dia) in calendario_df.index:
-                        status_forcado = 'UP' if dia.weekday() < 5 else 'PP'
-                        calendario_df.loc[(circuito, dia), 'Status'] = status_forcado
-    
-    df_periodo = df_atividades[~df_atividades['circuito'].isin(todos_circuitos_forcados)].copy()
-    
-    df_periodo = df_periodo[(df_periodo['datastart'].notna()) & (df_periodo['datastart'] <= fim_do_ultimo_dia) & (df_periodo['datastop'] >= inicio_mes)]
-    
-    for _, atividade in df_periodo.iterrows():
-        start_day = max(atividade['datastart'].normalize(), pd.Timestamp(inicio_mes))
-        end_day = min(atividade['datastop'].normalize(), pd.Timestamp(fim_mes))
+            status_atividade = atividade.get('status', 'UP')
+            
+            for dia in pd.date_range(start=start_day, end=end_day, freq='D'):
+                if (atividade['circuito'], dia) in calendario_df.index:
+                    calendario_df.loc[(atividade['circuito'], dia), 'Status'] = status_atividade
+
+        tipo_up_force = regras_de_force.get('tipo_up')
+        for circuito in circuitos_up_force:
+            if circuito in calendario_df.index.get_level_values('Circuito'):
+                if tipo_up_force == "Forçar 100% UP":
+                    calendario_df.loc[circuito, 'Status'] = 'UP'
+                elif tipo_up_force == "Forçar Semana Padrão (Seg-Sex UP)":
+                    for dia in dias_do_mes_range:
+                        if (circuito, dia) in calendario_df.index:
+                            status_forcado = 'UP' if dia.weekday() < 5 else 'PP'
+                            calendario_df.loc[(circuito, dia), 'Status'] = status_forcado
         
-        status_atividade = atividade.get('status', 'UP')
-        
-        for dia in pd.date_range(start=start_day, end=end_day, freq='D'):
-            if (atividade['circuito'], dia) in calendario_df.index:
-                calendario_df.loc[(atividade['circuito'], dia), 'Status'] = status_atividade
-    
-    relatorio_detalhado_df = calendario_df.unstack(level='Data')['Status']
-    relatorio_detalhado_df.columns = relatorio_detalhado_df.columns.day
+        for circuito in circuitos_pq_force:
+            if circuito in calendario_df.index.get_level_values('Circuito'):
+                calendario_df.loc[circuito, 'Status'] = 'PQ'
+
+    if not calendario_df.empty:
+        relatorio_detalhado_df = calendario_df.unstack(level='Data')['Status']
+        relatorio_detalhado_df.columns = relatorio_detalhado_df.columns.day
+    else:
+        # Se não havia outros circuitos, cria um DataFrame vazio com as colunas de dias
+        relatorio_detalhado_df = pd.DataFrame(columns=[d.day for d in dias_do_mes_range])
+
+    # Bloco para identificar e separar circuitos que só têm 'SD' e 'PP' (ou nenhuma atividade no mês)
+    indices_apenas_sd_pp = []
+    for index, row in relatorio_detalhado_df.iterrows():
+        valores_unicos = row.dropna().unique()
+        if len(valores_unicos) > 0 and all(val in ['PP', 'SD'] for val in valores_unicos):
+            indices_apenas_sd_pp.append(index)
+
+    df_para_calculo = relatorio_detalhado_df.drop(index=indices_apenas_sd_pp, errors='ignore')
+
+    # --- NOVO: Adiciona a linha do iDevice ao dataframe de cálculo e visualização ---
+    df_para_calculo.loc['iDevice'] = idevice_series
     
     if aplicar_min_dias_up:
-        for index, row in relatorio_detalhado_df.iterrows():
-            if index in todos_circuitos_forcados:
+        indices_para_remover = []
+        for index, row in df_para_calculo.iterrows():
+            if index in circuitos_up_force or index in circuitos_pq_force or index == 'iDevice':
                 continue
             dias_up_reais = (row == 'UP').sum()
             if dias_up_reais < min_dias_up:
-                relatorio_detalhado_df.loc[index] = ''
+                indices_para_remover.append(index)
+        df_para_calculo.drop(indices_para_remover, inplace=True)
 
-    circuitos_usados_df = relatorio_detalhado_df[relatorio_detalhado_df.iloc[:, 0] != '']
+    df_sd_pp_vazio = pd.DataFrame(index=indices_apenas_sd_pp, columns=relatorio_detalhado_df.columns).fillna('')
+    circuitos_vazio_df = pd.DataFrame(index=circuitos_vazio_force, columns=relatorio_detalhado_df.columns).fillna('')
+    df_vazios_total = pd.concat([df_sd_pp_vazio, circuitos_vazio_df])
+
+    if not df_vazios_total.empty:
+        # --- MODIFICADO: A ordenação agora usa a chave customizada ---
+        relatorio_detalhado_df = pd.concat([df_para_calculo, df_vazios_total]).sort_index(key=custom_sort_key)
+    else:
+        # --- MODIFICADO: A ordenação agora usa a chave customizada ---
+        relatorio_detalhado_df = df_para_calculo.sort_index(key=custom_sort_key)
+    
+    circuitos_usados_df = df_para_calculo
     circuitos_usados_count = len(circuitos_usados_df)
 
     sumario_ui = {'totais': {}, 'medias': {}}
@@ -305,7 +357,7 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
         cell_semana.fill = fill_dark_green; cell_semana.font = font_header_white; cell_semana.alignment = align_center
         cell_num = ws.cell(row=header_row_numeros, column=i, value=dia.day)
         cell_num.fill = fill_dark_green; cell_num.font = font_header_white; cell_num.alignment = align_center
-        ws.column_dimensions[col_letter].width = 4
+        ws.column_dimensions[col_letter].width = 5
         
     # Cabeçalho da Compilação
     ws.merge_cells(start_row=6, start_column=summary_start_col, end_row=6, end_column=summary_start_col + 3)
@@ -347,8 +399,7 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
             media_cell.style = style_media
             media_cell.border = border_thin_all
             media_cell.fill = fill_oee_subheader
-    
-    # --- INÍCIO DA SEÇÃO DE DESIGN PARA O OEE ---
+
     oee_start_row = 9
     col_label = oee_table_start_col
     col_value = oee_table_start_col + 1
@@ -450,11 +501,13 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     
     # OEE Final
     row_oee_final = oee_start_row + 5
-    ws.merge_cells(start_row=row_oee_final, start_column=col_result_label, end_row=row_oee_final, end_column=col_result_label)
+    
+    # Define o rótulo "OEE Final"
     cell = ws.cell(row=row_oee_final, column=col_result_label, value="OEE Final")
     cell.font = Font(name='Calibri', size=11, bold=True, color="FF0000")
     cell.border = border_thin_all
-    ws.merge_cells(start_row=row_oee_final, start_column=col_result_value, end_row=row_oee_final, end_column=col_result_value)
+    
+    # Define o valor calculado do OEE
     cell = ws.cell(row=row_oee_final, column=col_result_value, value=f"={get_column_letter(col_result_value)}{row_disp_final}*{get_column_letter(col_result_value)}{row_perf_final}*{get_column_letter(col_result_value)}{row_qual_final}")
     cell.style = 'Percent'
     cell.border = border_thin_all
