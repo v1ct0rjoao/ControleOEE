@@ -2,10 +2,10 @@ import pandas as pd
 import re
 import os
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side, NamedStyle
-from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import CellIsRule
 import locale
 
@@ -73,6 +73,28 @@ def limpar_dados_brutos(lista_arquivos_path, arquivo_saida_path, formato_data="d
     circuitos_unicos = sorted(df['circuito'].unique(), key=lambda x: int(re.search(r'\d+', x).group()))
     return (True, circuitos_unicos)
 
+def salvar_historico_csv(ano, mes, sumario, pasta_saida):
+    caminho_csv = os.path.join(pasta_saida, 'historico_oee.csv')
+    colunas = ['ano', 'mes', 'disponibilidade', 'performance', 'qualidade', 'oee_final']
+    nova_linha = {
+        'ano': ano,
+        'mes': mes,
+        'disponibilidade': sumario.get('Disponibilidade', 0),
+        'performance': sumario.get('Performance', 0),
+        'qualidade': sumario.get('Qualidade', 0),
+        'oee_final': sumario.get('OEE', 0)
+    }
+    df_novo = pd.DataFrame([nova_linha])
+    if os.path.exists(caminho_csv):
+        df_historico = pd.read_csv(caminho_csv)
+        filtro = (df_historico['ano'] == ano) & (df_historico['mes'] == mes)
+        if not df_historico[filtro].empty:
+            df_historico = df_historico[~filtro]
+        df_final = pd.concat([df_historico, df_novo], ignore_index=True)
+    else:
+        df_final = df_novo
+    df_final = df_final.sort_values(by=['ano', 'mes'])
+    df_final.to_csv(caminho_csv, index=False)
 
 def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, capacidade_total=300, regras_de_force=None, min_dias_up=1, aplicar_min_dias_up=True, ensaios_executados=None, ensaios_solicitados=None, relatorios_no_prazo=None, relatorios_emitidos=None):
     if regras_de_force is None:
@@ -108,29 +130,21 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
         .union(set(circuitos_pq_force))
     ).difference(set(circuitos_vazio_force))
     
-    # --- NOVO: Função de ordenação customizada ---
     def custom_sort_key(index):
-        # Atribui -1 para 'iDevice' para que ele seja sempre o primeiro.
-        # Para os outros, extrai o número para ordenação numérica.
-        # fillna(9999) trata outros casos não numéricos, colocando-os no final.
         numeric_parts = index.str.extract(r'(\d+)').iloc[:, 0].fillna('9999').astype(int)
         numeric_parts[index == 'iDevice'] = -1 
         return numeric_parts
     
-    # Remove 'iDevice' da lista de processamento normal se ele estiver lá por acaso
     circuitos_para_processar.discard('iDevice')
     
     circuitos_para_processar = sorted(list(circuitos_para_processar), key=lambda x: int(re.search(r'\d+', x).group()))
 
-    # --- NOVO: Geração dos dados para o circuito especial 'iDevice' ---
     idevice_data = {}
     for dia in dias_do_mes_range:
-        # dia.weekday() -> Segunda-feira=0, ..., Sábado=5, Domingo=6
         status = 'UP' if dia.weekday() < 5 else 'PP'
         idevice_data[dia.day] = status
     idevice_series = pd.Series(idevice_data, name='iDevice')
     
-    # Se não houver outros circuitos para processar, cria um DataFrame vazio para começar
     if not circuitos_para_processar:
         calendario_df = pd.DataFrame()
     else:
@@ -148,7 +162,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
         for _, atividade in df_periodo.iterrows():
             start_day = max(atividade['datastart'].normalize(), pd.Timestamp(inicio_mes))
             end_day = min(atividade['datastop'].normalize(), pd.Timestamp(fim_mes))
-            
             status_atividade = atividade.get('status', 'UP')
             
             for dia in pd.date_range(start=start_day, end=end_day, freq='D'):
@@ -174,10 +187,8 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
         relatorio_detalhado_df = calendario_df.unstack(level='Data')['Status']
         relatorio_detalhado_df.columns = relatorio_detalhado_df.columns.day
     else:
-        # Se não havia outros circuitos, cria um DataFrame vazio com as colunas de dias
         relatorio_detalhado_df = pd.DataFrame(columns=[d.day for d in dias_do_mes_range])
 
-    # Bloco para identificar e separar circuitos que só têm 'SD' e 'PP' (ou nenhuma atividade no mês)
     indices_apenas_sd_pp = []
     for index, row in relatorio_detalhado_df.iterrows():
         valores_unicos = row.dropna().unique()
@@ -186,7 +197,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
 
     df_para_calculo = relatorio_detalhado_df.drop(index=indices_apenas_sd_pp, errors='ignore')
 
-    # --- NOVO: Adiciona a linha do iDevice ao dataframe de cálculo e visualização ---
     df_para_calculo.loc['iDevice'] = idevice_series
     
     if aplicar_min_dias_up:
@@ -199,15 +209,15 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
                 indices_para_remover.append(index)
         df_para_calculo.drop(indices_para_remover, inplace=True)
 
+    df_para_calculo = df_para_calculo.loc[(df_para_calculo != '').any(axis=1) & (df_para_calculo.notna().any(axis=1))]
+
     df_sd_pp_vazio = pd.DataFrame(index=indices_apenas_sd_pp, columns=relatorio_detalhado_df.columns).fillna('')
     circuitos_vazio_df = pd.DataFrame(index=circuitos_vazio_force, columns=relatorio_detalhado_df.columns).fillna('')
     df_vazios_total = pd.concat([df_sd_pp_vazio, circuitos_vazio_df])
 
     if not df_vazios_total.empty:
-        # --- MODIFICADO: A ordenação agora usa a chave customizada ---
         relatorio_detalhado_df = pd.concat([df_para_calculo, df_vazios_total]).sort_index(key=custom_sort_key)
     else:
-        # --- MODIFICADO: A ordenação agora usa a chave customizada ---
         relatorio_detalhado_df = df_para_calculo.sort_index(key=custom_sort_key)
     
     circuitos_usados_df = df_para_calculo
@@ -258,7 +268,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     ws = wb.active
     ws.title = f"Controle_OEE_{ano}_{mes:02d}"
     
-    # --- Estilos de Fonte e Preenchimento ---
     font_title = Font(name='Calibri', size=40, bold=True, color="FFFFFF")
     font_header_white = Font(name='Calibri', size=11, bold=True, color="FFFFFF")
     font_legend = Font(name='Calibri', size=11, bold=True, color="000000")
@@ -266,7 +275,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     font_bold_black = Font(name='Calibri', size=11, bold=True, color="000000")
     
     align_center = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    align_right = Alignment(horizontal='right', vertical='center', wrap_text=True)
     
     border_thin_side = Side(border_style="thin", color="D9D9D9")
     border_thin_all = Border(left=border_thin_side, right=border_thin_side, top=border_thin_side, bottom=border_thin_side)
@@ -277,7 +285,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     fill_pp = PatternFill(fill_type="solid", start_color="9BC2E6")
     fill_sd = PatternFill(fill_type="solid", start_color="FFEB9C")
     
-    # --- Estilos para a nova tabela de OEE ---
     fill_oee_header = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
     fill_oee_subheader = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
     font_oee_header = Font(name='Calibri', size=11, bold=True, color="FFFFFF")
@@ -285,23 +292,20 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     
     last_day = fim_mes.day
     
-    # Definindo as colunas para o calendário e compilação
-    col_calendar_start = 2 # Coluna B
+    col_calendar_start = 2
     col_calendar_end = col_calendar_start + last_day - 1
     summary_start_col = col_calendar_end + 2
     
-    # Definindo as colunas para a tabela de OEE, ao lado da compilação
     oee_table_start_col = summary_start_col + 5
     col_oee_label = oee_table_start_col
     col_oee_value = oee_table_start_col + 1
     col_result_label = oee_table_start_col + 3
     col_result_value = oee_table_start_col + 4
     
-    # Ajustando larguras das colunas
     ws.column_dimensions['A'].width = 20
     ws.column_dimensions[get_column_letter(col_oee_label)].width = 25
     ws.column_dimensions[get_column_letter(col_oee_value)].width = 15
-    ws.column_dimensions[get_column_letter(col_oee_value + 1)].width = 2 # Espaço
+    ws.column_dimensions[get_column_letter(col_oee_value + 1)].width = 2
     ws.column_dimensions[get_column_letter(col_result_label)].width = 25
     ws.column_dimensions[get_column_letter(col_result_value)].width = 15
 
@@ -311,7 +315,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.fill = fill_dark_green; cell.font = font_title; cell.alignment = align_center
     ws.row_dimensions[1].height = 60
     
-    # Legenda e Capacidade
     ws.row_dimensions[3].height = 25
     legend_items = {"UP": fill_up, "PQ": fill_pq, "PP": fill_pp, "SD": fill_sd}
     start_col_legend = 2
@@ -327,7 +330,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell = ws.cell(row=3, column=capacidade_col_start); cell.value = f"Capacidade de utilização: {capacidade_total} circuitos"
     cell.fill = fill_dark_green; cell.font = font_header_white; cell.alignment = align_center
     
-    # Mes e Ano
     month_year_row = 5
     ws.row_dimensions[month_year_row].height = 50
     month_col_end = col_calendar_start + (last_day // 2)
@@ -344,12 +346,10 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     ws.row_dimensions[header_row_dias_semana].height = 25
     ws.row_dimensions[header_row_numeros].height = 25
     
-    # Cabeçalho dos Circuitos
     ws.merge_cells(start_row=6, start_column=1, end_row=7, end_column=1)
     cell = ws.cell(row=6, column=1); cell.value = "Circuitos"
     cell.fill = fill_dark_green; cell.font = font_header_white; cell.alignment = align_center
     
-    # Cabeçalho do Calendário
     dias_semana_map = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb']
     for i, dia in enumerate(dias_do_mes_range, start=col_calendar_start):
         col_letter = get_column_letter(i)
@@ -359,7 +359,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
         cell_num.fill = fill_dark_green; cell_num.font = font_header_white; cell_num.alignment = align_center
         ws.column_dimensions[col_letter].width = 5
         
-    # Cabeçalho da Compilação
     ws.merge_cells(start_row=6, start_column=summary_start_col, end_row=6, end_column=summary_start_col + 3)
     cell = ws.cell(row=6, column=summary_start_col)
     cell.value = "Compilação"; cell.fill = fill_dark_green; cell.font = font_header_white; cell.alignment = align_center
@@ -406,7 +405,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     col_result_label = oee_table_start_col + 3
     col_result_value = oee_table_start_col + 4
     
-    # Headers
     ws.merge_cells(start_row=oee_start_row, start_column=col_label, end_row=oee_start_row, end_column=col_value)
     cell = ws.cell(row=oee_start_row, column=col_label, value="Valores para o Cálculo do OEE")
     cell.fill = fill_oee_header
@@ -414,7 +412,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.alignment = align_center
     cell.border = border_thin_all
     
-    # Linha para Tempo Disponível
     row_tempo_disp = oee_start_row + 1
     cell = ws.cell(row=row_tempo_disp, column=col_label, value="Tempo Disponível (dias)")
     cell.fill = fill_oee_subheader
@@ -423,7 +420,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     ws.cell(row=row_tempo_disp, column=col_value, value=sumario_ui.get('tempo_disponivel', 0)).number_format = '0.00'
     ws.cell(row=row_tempo_disp, column=col_value).border = border_thin_all
     
-    # Linha para Tempo Real
     row_tempo_real = oee_start_row + 2
     cell = ws.cell(row=row_tempo_real, column=col_label, value="Tempo Real Utilizado (dias)")
     cell.fill = fill_oee_subheader
@@ -432,7 +428,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     ws.cell(row=row_tempo_real, column=col_value, value=sumario_ui.get('tempo_real_op', 0)).number_format = '0.00'
     ws.cell(row=row_tempo_real, column=col_value).border = border_thin_all
     
-    # Linha para Ensaios Solicitados
     row_ensaios_sol = oee_start_row + 3
     cell = ws.cell(row=row_ensaios_sol, column=col_label, value="Ensaios Solicitados")
     cell.fill = fill_oee_subheader
@@ -440,7 +435,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.border = border_thin_all
     ws.cell(row=row_ensaios_sol, column=col_value, value=sumario_ui.get('ensaios_solicitados', 0)).border = border_thin_all
     
-    # Linha para Ensaios Executados
     row_ensaios_exec = oee_start_row + 4
     cell = ws.cell(row=row_ensaios_exec, column=col_label, value="Ensaios Executados")
     cell.fill = fill_oee_subheader
@@ -448,7 +442,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.border = border_thin_all
     ws.cell(row=row_ensaios_exec, column=col_value, value=sumario_ui.get('ensaios_executados', 0)).border = border_thin_all
     
-    # Linha para Relatórios Emitidos
     row_rel_emit = oee_start_row + 5
     cell = ws.cell(row=row_rel_emit, column=col_label, value="Relatórios Emitidos")
     cell.fill = fill_oee_subheader
@@ -456,7 +449,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.border = border_thin_all
     ws.cell(row=row_rel_emit, column=col_value, value=sumario_ui.get('relatorios_emitidos', 0)).border = border_thin_all
     
-    # Linha para Relatórios no Prazo
     row_rel_prazo = oee_start_row + 6
     cell = ws.cell(row=row_rel_prazo, column=col_label, value="Relatórios no Prazo")
     cell.fill = fill_oee_subheader
@@ -464,7 +456,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.border = border_thin_all
     ws.cell(row=row_rel_prazo, column=col_value, value=sumario_ui.get('relatorios_no_prazo', 0)).border = border_thin_all
     
-    # Seção de Resultados
     ws.merge_cells(start_row=oee_start_row, start_column=col_result_label, end_row=oee_start_row, end_column=col_result_value)
     cell = ws.cell(row=oee_start_row, column=col_result_label, value="Resultados do OEE")
     cell.fill = fill_oee_header
@@ -472,7 +463,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.alignment = align_center
     cell.border = border_thin_all
 
-    # Disponibilidade
     row_disp_final = oee_start_row + 1
     cell = ws.cell(row=row_disp_final, column=col_result_label, value="Disponibilidade")
     cell.font = font_bold_black
@@ -481,7 +471,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.style = 'Percent'
     cell.border = border_thin_all
     
-    # Performance
     row_perf_final = oee_start_row + 2
     cell = ws.cell(row=row_perf_final, column=col_result_label, value="Performance")
     cell.font = font_bold_black
@@ -490,7 +479,6 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.style = 'Percent'
     cell.border = border_thin_all
 
-    # Qualidade
     row_qual_final = oee_start_row + 3
     cell = ws.cell(row=row_qual_final, column=col_result_label, value="Qualidade")
     cell.font = font_bold_black
@@ -499,15 +487,12 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     cell.style = 'Percent'
     cell.border = border_thin_all
     
-    # OEE Final
     row_oee_final = oee_start_row + 5
     
-    # Define o rótulo "OEE Final"
     cell = ws.cell(row=row_oee_final, column=col_result_label, value="OEE Final")
     cell.font = Font(name='Calibri', size=11, bold=True, color="FF0000")
     cell.border = border_thin_all
     
-    # Define o valor calculado do OEE
     cell = ws.cell(row=row_oee_final, column=col_result_value, value=f"={get_column_letter(col_result_value)}{row_disp_final}*{get_column_letter(col_result_value)}{row_perf_final}*{get_column_letter(col_result_value)}{row_qual_final}")
     cell.style = 'Percent'
     cell.border = border_thin_all
@@ -526,6 +511,8 @@ def gerar_dashboard_oee(arquivo_entrada_path, arquivo_saida_folder, ano, mes, ca
     except Exception as e:
         print(f"Erro ao salvar o excel: {e}")
         return None
+    
+    salvar_historico_csv(ano, mes, sumario_ui, arquivo_saida_folder)
 
     resultados = {
         'caminho_excel': caminho_completo_saida,

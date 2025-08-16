@@ -1,0 +1,17 @@
+# config.toml - Tema com as cores da Moura
+
+[theme]
+# Vermelho Moura para botões e elementos interativos
+primaryColor="#E30613"
+
+# Fundo principal da aplicação (um cinza bem claro)
+backgroundColor="#F0F2F6"
+
+# Cor de fundo da sidebar (branco puro para contraste)
+secondaryBackgroundColor="#FFFFFF"
+
+# Cor do texto (um cinza escuro, mais suave que preto puro)
+textColor="#262730"
+
+# Fonte padrão
+font="sans serif"
